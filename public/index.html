@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shaxmat mashqi</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { --light:#ecdcb8; --dark:#6f8f72; --pick:#e9c46a; --ink:#1d2a24; --bg:#f6f3ea; --line:#d9d2bf; }
+  @media (prefers-color-scheme: dark) { :root { --ink:#e8efe9; --bg:#16201b; --line:#2c3a33; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; font-family:system-ui,sans-serif; color:var(--ink); background:var(--bg); }
+  .wrap { max-width:480px; margin:0 auto; }
+  header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px; }
+  h1 { font-size:20px; margin:0; } #xp { font-weight:600; }
+  nav { display:flex; gap:6px; margin-bottom:12px; }
+  nav button { flex:1; padding-inline:2px; background:transparent; color:var(--ink); border:1px solid var(--line); padding:8px 0; }
+  nav button.on { background:var(--dark); color:#fff; border-color:var(--dark); }
+  #board { display:grid; grid-template-columns:repeat(8,1fr); width:100%; aspect-ratio:1; border-radius:6px; overflow:hidden; }
+  .sq { display:flex; align-items:center; justify-content:center; font-size:min(9vw,44px); cursor:pointer; user-select:none; }
+  .sq.l { background:var(--light); color:#222; } .sq.d { background:var(--dark); color:#111; } .sq.sel { background:var(--pick); }
+  #msg { margin-top:14px; min-height:48px; }
+  button { font:inherit; padding:10px 18px; border:0; border-radius:8px; background:var(--dark); color:#fff; cursor:pointer; }
+  button:focus-visible, .sq:focus-visible { outline:3px solid var(--pick); }
+  #next { display:none; }
+  #ctl { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; } select { font:inherit; padding:9px; border-radius:8px; }
+  ol { padding-left:22px; } li { padding:6px 0; border-bottom:1px solid var(--line); } li span { float:right; font-weight:600; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><h1 id="title"></h1><span id="xp"></span></header>
+  <nav id="tabs"></nav>
+  <section id="play"><div id="board" role="grid" aria-label="Shaxmat taxtasi"></div><div id="msg"></div>
+  <div id="ctl"></div><button id="next">Keyingi masala</button></section>
+  <section id="rank" hidden><ol id="list"></ol></section>
+</div>
+
+<script type="module">
+import { Chess } from "/vendor/chess.js";
+import { puzzles } from "/puzzles.js";
+import { makeSolver } from "/solver.js";
+
+const S = makeSolver(Chess);
+const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+const GLYPH = { wk:"♔",wq:"♕",wr:"♖",wb:"♗",wn:"♘",wp:"♙", bk:"♚",bq:"♛",br:"♜",bb:"♝",bn:"♞",bp:"♟" };
+const $ = (id) => document.getElementById(id);
+// Telegramsiz sinash uchun (DEV_MODE=1): har tabga alohida sinov foydalanuvchisi
+const devId = sessionStorage.devId || (sessionStorage.devId = 100 + Math.floor(Math.random() * 900));
+const initData = tg?.initData || `dev:${devId}:Dev${devId}`;
+const api = (url, body) => fetch(url, {
+  method: body ? "POST" : "GET",
+  headers: { "content-type": "application/json", "x-init-data": initData },
+  body: body && JSON.stringify(body),
+}).then((r) => r.json());
+
+const MODES = [{ k: 1, t: "1 yurishda mat" }, { k: 2, t: "2 yurishda mat" }, { k: 3, t: "3 yurishda mat" }, { k: "t", t: "Trener bilan o'yin" }, { k: "o", t: "Onlayn o'yin" }, { k: 0, t: "Reyting" }];
+let orient = "w", mode = 1, pool = [], idx = -1, game, left, cur, selected = null, done = false, solved = new Set(), xp = 0;
+
+$("tabs").innerHTML = "";
+for (const m of MODES) {
+  const b = document.createElement("button"); b.textContent = typeof m.k === "number" && m.k ? "Mat " + m.k : m.t.split(" ")[0];
+  b.onclick = () => setMode(m.k); b.dataset.k = m.k; $("tabs").appendChild(b);
+}
+
+async function init() {
+  const me = await api("/api/me");
+  if (me.error) { $("msg").textContent = "Telegram ichida oching."; return; }
+  xp = me.xp; solved = new Set(me.solved); $("xp").textContent = xp + " XP";
+  setMode(1);
+}
+
+function setMode(k) {
+  mode = k;
+  [...$("tabs").children].forEach((b) => b.classList.toggle("on", b.dataset.k === String(k)));
+  $("play").hidden = k === 0; $("rank").hidden = k !== 0;
+  $("title").textContent = MODES.find((m) => m.k === k).t;
+  $("ctl").innerHTML = ""; $("next").style.display = "none"; selected = null;
+  if (k === 0) return showRank();
+  if (k === "t") return trainer.open();
+  if (k === "o") return online.open();
+  pool = puzzles.filter((p) => p.n === k); idx = -1;
+  // avval yechilmaganlarini ko'rsatamiz
+  pool.sort((a, b) => solved.has(a.id) - solved.has(b.id));
+  next();
+}
+
+async function showRank() {
+  const rows = await api("/api/leaderboard");
+  $("list").innerHTML = rows.map((r) => `<li>${r.name.replace(/[<>&]/g, "")}<span>${r.xp} XP</span></li>`).join("");
+}
+
+function next() {
+  idx = (idx + 1) % pool.length; cur = pool[idx];
+  game = new Chess(cur.fen); orient = game.turn(); left = cur.n; selected = null; done = false;
+  $("next").style.display = "none";
+  $("msg").textContent = (game.turn() === "w" ? "Oq" : "Qora") + " yuradi. " + cur.n + " yurishda mat toping." + (solved.has(cur.id) ? " (yechilgan)" : "");
+  draw();
+}
+
+function draw() {
+  const flip = orient === "b";                                // o'yinchi tomoni pastda
+  const b = $("board"); b.innerHTML = "";
+  const rows = flip ? [7,6,5,4,3,2,1,0] : [0,1,2,3,4,5,6,7];
+  for (const r of rows) for (let c = 0; c < 8; c++) {
+    const col = flip ? 7 - c : c, name = "abcdefgh"[col] + (8 - r), p = game.board()[r][col];
+    const el = document.createElement("div");
+    el.className = "sq " + ((r + col) % 2 ? "d" : "l") + (selected === name ? " sel" : "");
+    el.textContent = p ? GLYPH[p.color + p.type] : ""; el.tabIndex = 0; el.onclick = () => tap(name);
+    b.appendChild(el);
+  }
+}
+
+async function win() {
+  done = true; $("next").style.display = "block";
+  const res = await api("/api/solve", { puzzleId: cur.id });
+  solved.add(cur.id);
+  if (res.xp != null) { xp = res.xp; $("xp").textContent = xp + " XP"; }
+  $("msg").textContent = res.gained ? `To'g'ri! Mat. +${res.gained} XP` : "To'g'ri! Mat. (bu masala uchun XP olingan)";
+  tg?.HapticFeedback?.notificationOccurred("success");
+}
+
+function tap(sq) {
+  if (mode === "t") return trainer.tap(sq);
+  if (mode === "o") return online.tap(sq);
+  if (done) return;
+  const piece = game.get(sq);
+  if (piece && piece.color === game.turn()) { selected = sq; draw(); return; }
+  if (!selected) return;
+  const t = new Chess(game.fen()); let mv = null;
+  try { mv = t.move({ from: selected, to: sq, promotion: "q" }); } catch {}
+  selected = null;
+  if (!mv) { $("msg").textContent = "Bunday yurish mumkin emas."; return draw(); }
+  if (t.isCheckmate()) { game = t; draw(); return win(); }
+  if (left > 1 && S.forced(t, left - 1)) {
+    // yurish to'g'ri: raqib javob beradi
+    const reply = S.defend(t, left - 1); t.move(reply); game = t; left--;
+    $("msg").textContent = `To'g'ri yurish. Raqib ${reply} o'ynadi. ${left} yurishda mat toping.`;
+  } else {
+    $("msg").textContent = "Bu yo'l mat bermaydi. Boshqa yurishni sinang.";
+    tg?.HapticFeedback?.notificationOccurred("error");
+  }
+  draw();
+}
+
+// Tanlash va yurish: to'g'ri yurish bo'lsa {mv, t} qaytaradi
+function pickMove(sq, color) {
+  const p = game.get(sq);
+  if (p && p.color === color) { selected = sq; draw(); return null; }
+  if (!selected) return null;
+  const t = new Chess(game.fen()); let mv = null;
+  try { mv = t.move({ from: selected, to: sq, promotion: "q" }); } catch {}
+  selected = null; if (!mv) draw();
+  return mv ? { mv, t } : null;
+}
+const say = (t) => ($("msg").textContent = t);
+function buttons(list) {
+  $("ctl").innerHTML = "";
+  for (const [label, fn] of list) { const b = document.createElement("button"); b.textContent = label; b.onclick = fn; $("ctl").appendChild(b); }
+}
+
+// ---------- Trener (Stockfish brauzerda) ----------
+const trainer = {
+  worker: null, level: 8, gid: 0,
+  open() {
+    if (!this.worker) { this.worker = new Worker("/engine/stockfish-19-lite-single.js"); this.worker.postMessage("uci"); }
+    this.level = 8; this.newGame();
+  },
+  levelUI() {
+    buttons([["Yangi o'yin", () => this.newGame()], ["Maslahat", () => this.hint()]]);
+    const sel = document.createElement("select");
+    sel.innerHTML = [["2","Oson"],["8","O'rta"],["16","Qiyin"]].map(([v,t]) => `<option value="${v}" ${Number(v)===this.level?"selected":""}>${t}</option>`).join("");
+    sel.onchange = () => { this.level = Number(sel.value); this.newGame(); };
+    $("ctl").appendChild(sel);
+  },
+  newGame() {
+    this.gid++; game = new Chess(); orient = Math.random() < 0.5 ? "w" : "b"; done = false; selected = null;
+    this.worker.postMessage("setoption name Skill Level value " + this.level);
+    this.levelUI(); draw(); say("Siz " + (orient === "w" ? "oq" : "qora") + " bilan o'ynaysiz.");
+    if (orient === "b") this.engine();
+  },
+  ask(fen, go) {
+    return new Promise((res) => {
+      const h = (e) => { const m = /^bestmove (\S+)/.exec(e.data); if (m) { this.worker.removeEventListener("message", h); res(m[1]); } };
+      this.worker.addEventListener("message", h);
+      this.worker.postMessage("position fen " + fen); this.worker.postMessage(go);
+    });
+  },
+  over() {
+    if (game.isCheckmate()) say(game.turn() === orient ? "Mat. Trener yutdi." : "Mat! Siz yutdingiz.");
+    else if (game.isDraw()) say("Durang.");
+    else return false;
+    return (done = true);
+  },
+  async engine() {
+    const id = this.gid; say("Trener o'ylayapti...");
+    const mv = await this.ask(game.fen(), "go movetime 600");
+    if (id !== this.gid || mode !== "t") return;
+    game.move({ from: mv.slice(0, 2), to: mv.slice(2, 4), promotion: mv[4] }); draw();
+    if (!this.over()) say("Sizning yurishingiz.");
+  },
+  tap(sq) {
+    if (done || game.turn() !== orient) return;
+    const r = pickMove(sq, orient); if (!r) return;
+    game = r.t; draw(); if (!this.over()) this.engine();
+  },
+  async hint() {
+    if (done || game.turn() !== orient) return;
+    const mv = await this.ask(game.fen(), "go depth 12");
+    const m = new Chess(game.fen()).move({ from: mv.slice(0, 2), to: mv.slice(2, 4), promotion: mv[4] });
+    say("Maslahat: " + m.san);
+  },
+};
+
+// ---------- Onlayn o'yin (WebSocket, XP bo'yicha juftlash) ----------
+const online = {
+  ws: null, g: new Chess(), color: "w", active: false, text: "Raqib qidirish tugmasini bosing.",
+  open() { this.show(); },
+  show() {
+    if (mode !== "o") return;
+    game = this.g; orient = this.color; done = !this.active; selected = null; say(this.text); draw();
+    buttons(this.active ? [["Taslim bo'lish", () => this.send({ type: "resign" })]] : [["Raqib qidirish", () => this.find()]]);
+  },
+  connect() {
+    return new Promise((res) => {
+      if (this.ws && this.ws.readyState === 1) return res();
+      this.ws = new WebSocket((location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws");
+      this.ws.onopen = res; this.ws.onmessage = (e) => this.on(JSON.parse(e.data));
+    });
+  },
+  send(o) { this.ws.send(JSON.stringify(o)); },
+  async find() {
+    await this.connect(); this.send({ type: "queue", initData });
+    this.text = "Raqib qidirilmoqda... XP si yaqin o'yinchi topiladi."; this.show();
+    buttons([["Bekor qilish", () => { this.send({ type: "cancel" }); this.text = "Qidiruv to'xtatildi."; this.show(); }]]);
+  },
+  on(m) {
+    if (m.type === "start") {
+      this.g = new Chess(m.fen); this.color = m.color; this.active = true;
+      this.text = `Raqib: ${m.opp.name} (${m.opp.xp} XP). Siz ${m.color === "w" ? "oq" : "qora"}.`;
+    } else if (m.type === "move" || m.type === "sync") {
+      this.g = new Chess(m.fen);
+      this.text = this.g.turn() === this.color ? "Sizning yurishingiz." : "Raqib yuryapti...";
+    } else if (m.type === "end") {
+      this.active = false; xp = m.xp; $("xp").textContent = xp + " XP";
+      const r = { win: "Siz yutdingiz!", lose: "Siz yutqazdingiz.", draw: "Durang." }[m.result];
+      this.text = `${r} (${m.reason}) +${m.gained} XP`;
+    } else if (m.type === "error") this.text = "Xatolik: Telegram ichida oching.";
+    this.show();
+  },
+  tap(sq) {
+    if (!this.active || this.g.turn() !== this.color) return;
+    const r = pickMove(sq, this.color); if (!r) return;
+    this.g = r.t; game = r.t; draw(); this.send({ type: "move", from: r.mv.from, to: r.mv.to });
+  },
+};
+
+$("next").onclick = next;
+init();
+</script>
+</body>
+</html>
